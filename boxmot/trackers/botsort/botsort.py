@@ -1,30 +1,146 @@
 # Mikel Broström 🔥 Yolo Tracking 🧾 AGPL-3.0 license
 
-import torch
+import lap
 import numpy as np
 from pathlib import Path
+from typing import List, Tuple
 
 from boxmot.motion.kalman_filters.xywh_kf import KalmanFilterXYWH
-from boxmot.appearance.reid_auto_backend import ReidAutoBackend
-from boxmot.motion.cmc.sof import SOF
 from boxmot.trackers.botsort.basetrack import BaseTrack, TrackState
-from boxmot.utils.matching import (embedding_distance, fuse_score,
-                                   iou_distance, linear_assignment)
+from boxmot.utils.iou import AssociationFunction
 from boxmot.trackers.basetracker import BaseTracker
-from boxmot.trackers.botsort.botsort_utils import joint_stracks, sub_stracks, remove_duplicate_stracks 
 from boxmot.trackers.botsort.botsort_track import STrack
 from boxmot.motion.cmc import get_cmc_method
 
 
+def iou_distance(atracks, btracks):
+    """
+    Compute cost based on IoU
+    :type atracks: list[STrack]
+    :type btracks: list[STrack]
+
+    :rtype cost_matrix np.ndarray
+    """
+
+    if (len(atracks) > 0 and isinstance(atracks[0], np.ndarray)) or (
+        len(btracks) > 0 and isinstance(btracks[0], np.ndarray)
+    ):
+        atlbrs = atracks
+        btlbrs = btracks
+    else:
+        atlbrs = [track.xyxy for track in atracks]
+        btlbrs = [track.xyxy for track in btracks]
+
+    ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float32)
+    if ious.size == 0:
+        return ious
+    _ious = AssociationFunction.iou_batch(atlbrs, btlbrs)
+
+    cost_matrix = 1 - _ious
+
+    return cost_matrix
+
+def joint_stracks(tlista: List['STrack'], tlistb: List['STrack']) -> List['STrack']:
+    """
+    Joins two lists of tracks, ensuring that there are no duplicates based on track IDs.
+
+    Args:
+        tlista (List[STrack]): The first list of tracks.
+        tlistb (List[STrack]): The second list of tracks.
+
+    Returns:
+        List[STrack]: A combined list of tracks from both input lists, without duplicates.
+    """
+    exists = {}
+    res = []
+    for t in tlista:
+        exists[t.id] = 1
+        res.append(t)
+    for t in tlistb:
+        tid = t.id
+        if not exists.get(tid, 0):
+            exists[tid] = 1
+            res.append(t)
+    return res
+
+def sub_stracks(tlista: List['STrack'], tlistb: List['STrack']) -> List['STrack']:
+    """
+    Subtracts the tracks in tlistb from tlista based on track IDs.
+
+    Args:
+        tlista (List[STrack]): The list of tracks from which tracks will be removed.
+        tlistb (List[STrack]): The list of tracks to be removed from tlista.
+
+    Returns:
+        List[STTrack]: The remaining tracks after removal.
+    """
+    stracks = {t.id: t for t in tlista}
+    for t in tlistb:
+        tid = t.id
+        if tid in stracks:
+            del stracks[tid]
+    return list(stracks.values())
+
+def remove_duplicate_stracks(stracksa: List['STrack'], stracksb: List['STrack']) -> Tuple[List['STrack'], List['STrack']]:
+    """
+    Removes duplicate tracks between two lists based on their IoU distance and track duration.
+
+    Args:
+        stracksa (List[STrack]): The first list of tracks.
+        stracksb (List[STrack]): The second list of tracks.
+
+    Returns:
+        Tuple[List[STrack], List[STrack]]: The filtered track lists, with duplicates removed.
+    """
+    pdist = iou_distance(stracksa, stracksb)
+    pairs = np.where(pdist < 0.15)
+    dupa, dupb = [], []
+
+    for p, q in zip(*pairs):
+        timep = stracksa[p].frame_id - stracksa[p].start_frame
+        timeq = stracksb[q].frame_id - stracksb[q].start_frame
+        if timep > timeq:
+            dupb.append(q)
+        else:
+            dupa.append(p)
+
+    resa = [t for i, t in enumerate(stracksa) if i not in dupa]
+    resb = [t for i, t in enumerate(stracksb) if i not in dupb]
+    
+    return resa, resb
+
+def fuse_score(cost_matrix, detections):
+    if cost_matrix.size == 0:
+        return cost_matrix
+    iou_sim = 1 - cost_matrix
+    det_confs = np.array([det.conf for det in detections])
+    det_confs = np.expand_dims(det_confs, axis=0).repeat(cost_matrix.shape[0], axis=0)
+    fuse_sim = iou_sim * det_confs
+    fuse_cost = 1 - fuse_sim
+    return fuse_cost
+
+def linear_assignment(cost_matrix, thresh):
+    if cost_matrix.size == 0:
+        return (
+            np.empty((0, 2), dtype=int),
+            tuple(range(cost_matrix.shape[0])),
+            tuple(range(cost_matrix.shape[1])),
+        )
+    matches, unmatched_a, unmatched_b = [], [], []
+    cost, x, y = lap.lapjv(cost_matrix, extend_cost=True, cost_limit=thresh)
+    for ix, mx in enumerate(x):
+        if mx >= 0:
+            matches.append([ix, mx])
+    unmatched_a = np.where(x < 0)[0]
+    unmatched_b = np.where(y < 0)[0]
+    matches = np.asarray(matches)
+    return matches, unmatched_a, unmatched_b
 
 class BotSort(BaseTracker):
     """
     BoTSORT Tracker: A tracking algorithm that combines appearance and motion-based tracking.
 
     Args:
-        reid_weights (str): Path to the model weights for ReID.
-        device (torch.device): Device to run the model on (e.g., 'cpu' or 'cuda').
-        half (bool): Use half-precision (fp16) for faster inference.
         per_class (bool, optional): Whether to perform per-class tracking.
         track_high_thresh (float, optional): Detection confidence threshold for first association.
         track_low_thresh (float, optional): Detection confidence threshold for ignoring detections.
@@ -41,9 +157,6 @@ class BotSort(BaseTracker):
 
     def __init__(
         self,
-        reid_weights: Path,
-        device: torch.device,
-        half: bool,
         per_class: bool = False,
         track_high_thresh: float = 0.5,
         track_low_thresh: float = 0.1,
@@ -55,7 +168,7 @@ class BotSort(BaseTracker):
         cmc_method: str = "ecc",
         frame_rate=30,
         fuse_first_associate: bool = False,
-        with_reid: bool = True,
+        with_reid: bool = False,
     ):
         super().__init__(per_class=per_class)
         self.lost_stracks = []  # type: list[STrack]
@@ -77,9 +190,7 @@ class BotSort(BaseTracker):
         self.appearance_thresh = appearance_thresh
         self.with_reid = with_reid
         if self.with_reid:
-            self.model = ReidAutoBackend(
-                weights=reid_weights, device=device, half=half
-            ).model
+            raise NotImplementedError("ReID was removed to exclude PyTorch dependency.")
 
         self.cmc = get_cmc_method(cmc_method)()
         self.fuse_first_associate = fuse_first_associate
@@ -97,7 +208,7 @@ class BotSort(BaseTracker):
 
         # Extract appearance features
         if self.with_reid and embs is None:
-            features_high = self.model.get_features(dets_first[:, 0:4], img)
+            raise NotImplementedError("ReID was removed to exclude PyTorch dependency.")
         else:
             features_high = embs_first if embs_first is not None else []
 
@@ -140,7 +251,7 @@ class BotSort(BaseTracker):
     def _create_detections(self, dets_first, features_high):
         if len(dets_first) > 0:
             if self.with_reid:
-                detections = [STrack(det, f, max_obs=self.max_obs) for (det, f) in zip(dets_first, features_high)]
+                raise NotImplementedError("ReID was removed to exclude PyTorch dependency.")
             else:
                 detections = [STrack(det, max_obs=self.max_obs) for det in dets_first]
         else:
@@ -169,13 +280,10 @@ class BotSort(BaseTracker):
         ious_dists = iou_distance(strack_pool, detections)
         ious_dists_mask = ious_dists > self.proximity_thresh
         if self.fuse_first_associate:
-            ious_dists = fuse_score(ious_dists, detections)
+            raise NotImplementedError("Fusing associates was removed to exclude PyTorch dependency.")
 
         if self.with_reid:
-            emb_dists = embedding_distance(strack_pool, detections) / 2.0
-            emb_dists[emb_dists > self.appearance_thresh] = 1.0
-            emb_dists[ious_dists_mask] = 1.0
-            dists = np.minimum(ious_dists, emb_dists)
+            raise NotImplementedError("ReID was removed to exclude PyTorch dependency.")
         else:
             dists = ious_dists
 
@@ -249,10 +357,7 @@ class BotSort(BaseTracker):
         
         # Fuse scores for IoU-based and embedding-based matching (if applicable)
         if self.with_reid:
-            emb_dists = embedding_distance(unconfirmed, detections) / 2.0
-            emb_dists[emb_dists > self.appearance_thresh] = 1.0
-            emb_dists[ious_dists_mask] = 1.0  # Apply the IoU mask to embedding distances
-            dists = np.minimum(ious_dists, emb_dists)
+            raise NotImplementedError("ReID was removed to exclude PyTorch dependency.")
         else:
             dists = ious_dists
 
