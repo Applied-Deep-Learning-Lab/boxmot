@@ -280,7 +280,7 @@ class BotSort(BaseTracker):
         ious_dists = iou_distance(strack_pool, detections)
         ious_dists_mask = ious_dists > self.proximity_thresh
         if self.fuse_first_associate:
-            raise NotImplementedError("Fusing associates was removed to exclude PyTorch dependency.")
+            ious_dists = fuse_score(ious_dists, detections)
 
         if self.with_reid:
             raise NotImplementedError("ReID was removed to exclude PyTorch dependency.")
